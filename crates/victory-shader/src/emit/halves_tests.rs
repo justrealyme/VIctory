@@ -251,6 +251,43 @@ fn reads_across_32_lane_halves_are_refused_with_their_reason() {
     // first lane, in halves or not.
     assert_eq!(refusal(&first, 64, 0), "translated");
 
+    // With console lanes the program runs in halves, where lane 32 is the
+    // second host wave's first lane: a value that differs between the
+    // halves (the thread id) would read 32 there, the console 0.
+    let first_varying = [
+        PROLOGUE.as_slice(),
+        &[
+            0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+            0xD765_0001,
+            0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+            0x7E18_0500, // v_readfirstlane_b32 s12, v0
+            0x7E04_020C, // v_mov_b32 v2, s12
+        ],
+        &store(1, 0),
+        &store(2, 4),
+        &[S_ENDPGM],
+    ]
+    .concat();
+    let why = refusal(&first_varying, 64, 0);
+    assert!(
+        why.contains("a first-lane read of a value that may differ between 32-lane halves"),
+        "{why}"
+    );
+    // A first-lane read nothing uses costs nothing.
+    let unused_first = [
+        PROLOGUE.as_slice(),
+        &[
+            0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+            0xD765_0001,
+            0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+            0x7E18_0500, // v_readfirstlane_b32 s12, v0
+        ],
+        &store(1, 0),
+        &[S_ENDPGM],
+    ]
+    .concat();
+    assert_eq!(refusal(&unused_first, 64, 0), "translated");
+
     // A value read across halves that nothing uses costs nothing.
     let unused = [
         PROLOGUE.as_slice(),
@@ -373,4 +410,106 @@ fn wave64_programs_in_halves_match_the_console_on_every_gpu() {
 "
         )
     );
+}
+
+/// Per thread `l` of a group of 128 (two console wave64s), two dwords at
+/// `l * 32`: the first lane of `l >> 6` (one value per console wave, the
+/// same in both its halves) and the lane `v_mbcnt` counts.
+fn first_lane_alike() -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0xD765_0001,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+        0xD766_0001,
+        0x0002_02C1, // v_mbcnt_hi_u32_b32 v1, -1, v1
+        0x2C04_0086, // v_lshrrev_b32 v2, 6, v0
+        0x7E18_0502, // v_readfirstlane_b32 s12, v2
+        0x7E06_020C, // v_mov_b32 v3, s12
+    ]);
+    w.extend(store(3, 0));
+    w.extend(store(1, 4));
+    w.push(S_ENDPGM);
+    w
+}
+
+#[test]
+fn the_first_lane_program_is_what_its_comments_say() {
+    let code: Vec<u8> = first_lane_alike()
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+    let all = gfx10::decode(&code)
+        .expect("decodes")
+        .iter()
+        .map(|i| i.text(true))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for want in [
+        "v_lshrrev_b32 v2, 6, v0",
+        "v_readfirstlane_b32 s12, v2",
+        "v_mov_b32 v3, s12",
+        "buffer_store_dword v1, v16, s[40:43], 0 offen offset:4",
+    ] {
+        assert!(all.contains(want), "{want:?} not in:\n{all}");
+    }
+}
+
+/// A first-lane read of a value the same in every lane of the console wave
+/// ([`first_lane_alike`]) translates in halves, and every hardware adapter
+/// gives the console's results: each half reads its console wave's value.
+#[test]
+fn first_lanes_of_alike_values_match_the_console_on_every_gpu() {
+    let n = native(&first_lane_alike(), true, 128, 0);
+    let shader = shader(lowered(&n, true).expect("halves"));
+    let want: Vec<[u32; 2]> = (0..128).map(|l| [l >> 6, l & 63]).collect();
+    let views = [
+        View::Texture(1, 1, &[[0.0; 4]]),
+        View::Buffer {
+            data: &[0; 4],
+            stride: Stride::Structured(16),
+        },
+        View::RawUav(128 * 8),
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let hosts = Host::each_hardware();
+    if hosts.is_empty() {
+        eprintln!("no SM 6.6 hardware device; skipped");
+    }
+    let mut failed = Vec::new();
+    for (adapter, host) in &hosts {
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{adapter}: no pipeline: {e}"));
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{adapter}: dispatch failed: {e}"));
+        let wrong: Vec<String> = out[0]
+            .chunks(8)
+            .zip(&want)
+            .enumerate()
+            .filter(|(_, (got, want))| got[..2] != want[..])
+            .map(|(l, (got, want))| {
+                format!("{adapter}: lane {l}: {:?}, the console {want:?}", &got[..2])
+            })
+            .collect();
+        eprintln!(
+            "{adapter}: {} lanes of 128 differ from the console",
+            wrong.len()
+        );
+        failed.extend(wrong);
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
 }

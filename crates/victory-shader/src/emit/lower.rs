@@ -247,6 +247,9 @@ struct Lower<'a> {
     halves_refused: Option<Why>,
     /// [`Lower::relabelled_flat`], once made.
     relabelled: Option<V>,
+    /// In halves: VGPR values the same in every lane of the console wave
+    /// ([`halves::lane_uniform`]), whose first lane either half reads.
+    alike: HashSet<Value>,
     /// Pixel: an ordered section (POPS), whose UAVs the host makes
     /// rasterizer-ordered views.
     pops: bool,
@@ -691,6 +694,11 @@ impl<'a> Lower<'a> {
             halves,
             halves_refused,
             relabelled: None,
+            alike: if halves {
+                halves::lane_uniform(x)
+            } else {
+                HashSet::new()
+            },
             pops: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
                 if db_shader_control & 1 << 16 != 0),
             root_memory,
@@ -6451,11 +6459,19 @@ impl<'a> Lower<'a> {
                 int(self, a)
             }
             "v_readfirstlane_b32" => {
+                // In halves the host wave's first lane is the console's only
+                // for a value the same in both halves.
+                if self.halves
+                    && matches!(v.src.first(), Some(&Operand::Vector { reg, .. })
+                        if !inst.read(Reg::V(reg)).is_some_and(|x| self.alike.contains(&x)))
+                {
+                    return Err(halves::FIRST_ACROSS);
+                }
                 let a = s(self, 0)?;
-                // shortcut: in halves, the first lane of the host wave, as in
-                // every program without console lanes (whose host waves are
-                // the driver's choice): the console's where the value is the
-                // same in every lane, what the compiler reads first lanes for.
+                // shortcut: without console lanes, the first lane of the host
+                // wave (whose waves are the driver's choice): the console's
+                // where the value is the same in every lane, what the compiler
+                // reads first lanes for.
                 self.s.flags |= flags::WAVE_OPS;
                 let r = self.s.op(
                     c,
